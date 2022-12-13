@@ -20,6 +20,26 @@
     }                                                                   \
   }
 
+#define CHILD_NCCL_CALL_NON_BLOCKING(msg)                               \
+  {                                                                     \
+    for (int i = 0; i < this->comms.size(); ++i)                        \
+    {                                                                   \
+      ncclResult_t ncclAsyncErr;                                        \
+      int loop_counter = 0;                                             \
+      do                                                                \
+      {                                                                 \
+        loop_counter++;                                                 \
+        if (loop_counter == MAX_LOOP_COUNTER) break;                    \
+        ncclCommGetAsyncError(this->comms[i], &ncclAsyncErr);           \
+      } while(ncclAsyncErr == ncclInProgress);                          \
+      if (ncclAsyncErr != ncclSuccess)                                  \
+      {                                                                 \
+        ERROR("Child process %d fails NCCL call %s with code %d\n", this->childId, msg, ncclAsyncErr);  \
+        return TEST_FAIL;                                               \
+      }                                                                 \
+    }                                                                   \
+  }
+
 #define PIPE_READ(val) \
   if (read(childReadFd, &val, sizeof(val)) != sizeof(val)) return TEST_FAIL;
 
@@ -126,6 +146,7 @@ namespace RcclUnitTesting
     PIPE_READ(this->totalRanks);
     PIPE_READ(this->rankOffset);
     PIPE_READ(this->numCollectivesInGroup);
+    PIPE_READ(this->useBlocking);
     bool useMultiRankPerGpu;
     PIPE_READ(useMultiRankPerGpu);
 
@@ -170,16 +191,28 @@ namespace RcclUnitTesting
 
       if (useMultiRankPerGpu)
       {
-	if (ncclCommInitRankMulti(&this->comms[localRank], this->totalRanks, id, globalRank, globalRank) != ncclSuccess)
+        if (ncclCommInitRankMulti(&this->comms[localRank], this->totalRanks, id, globalRank, globalRank) != ncclSuccess)
         {
-	  ERROR("Rank %d on child %d unable to call ncclCommInitRankMulti\n", globalRank, this->childId);
-	  status = TEST_FAIL;
-	  break;
-	}
+          ERROR("Rank %d on child %d unable to call ncclCommInitRankMulti\n", globalRank, this->childId);
+          status = TEST_FAIL;
+          break;
+        }
+      }
+      else if (this->useBlocking == false)
+      { 
+        // When non-blocking communicator is desired call ncclCommInitRankConfig with appropriate flag
+        ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+        config.blocking = 0;
+        if (ncclCommInitRankConfig(&this->comms[localRank], this->totalRanks, id, globalRank, &config) != ncclSuccess)
+        { 
+          ERROR("Rank %d on child %d unable to call ncclCommInitRankConfig\n", globalRank, this->childId);
+          status = TEST_FAIL;
+          break;
+        } 
       }
       else
       {
-	if (ncclCommInitRank(&this->comms[localRank], this->totalRanks, id, globalRank) != ncclSuccess)
+        if (ncclCommInitRank(&this->comms[localRank], this->totalRanks, id, globalRank) != ncclSuccess)
         {
           ERROR("Rank %d on child %d unable to call ncclCommInitRank\n", globalRank, this->childId);
           status = TEST_FAIL;
@@ -187,10 +220,26 @@ namespace RcclUnitTesting
         }
       }
     }
-    if (status == TEST_SUCCESS)
+    if (this->useBlocking == false)
     {
-      CHILD_NCCL_CALL(ncclGroupEnd(), "ncclGroupStart");
+      CHILD_NCCL_CALL_NON_BLOCKING("ncclCommGetAsyncErrorInitRankConfig");
     }
+    if (status == TEST_SUCCESS)
+    { 
+      // Check if the communicator is non-blocking
+      if (this->useBlocking == false)
+      { 
+        // handle the ncclGroupEnd in case of non-blocking communication
+        ncclResult_t Group_End_state = ncclGroupEnd();
+        if (Group_End_state != ncclSuccess) CHILD_NCCL_CALL_NON_BLOCKING("ncclCommGetAsyncErrorGroup");
+      }
+      else 
+      { 
+        // In case of blocking communication just call ncclGroupEnd
+        CHILD_NCCL_CALL(ncclGroupEnd(), "ncclGroupEnd");
+      }
+    }
+    
     if (this->verbose) INFO("Child %d finishes InitComms() [%s]\n",
                             this->childId, status == TEST_SUCCESS ? "SUCCESS" : "FAIL");
     return status;
@@ -337,6 +386,9 @@ namespace RcclUnitTesting
 
   ErrCode TestBedChild::ExecuteCollectives()
   {
+    bool useHipGraph = false;
+    PIPE_READ(useHipGraph);
+
     int numRanksToExecute, tempRank;
     std::vector<int> ranksToExecute = {};
     PIPE_READ(numRanksToExecute);
@@ -345,7 +397,31 @@ namespace RcclUnitTesting
       PIPE_READ(tempRank);
       ranksToExecute.push_back(tempRank - this->rankOffset);
     }
-    if (this->verbose) INFO("Child %d begins ExecuteCollectives()\n", this->childId);
+    if (this->verbose) INFO("Child %d begins ExecuteCollectives() %s\n", this->childId, useHipGraph ? "(using hipGraphs)" : "");
+
+    // Determine which local ranks to execute on
+    std::vector<int> localRanksToExecute;
+    for (int localRank = 0; localRank < this->deviceIds.size(); ++localRank)
+    {
+      // If ranksToExeute is empty, execute all local ranks belonging to this child
+      if (!ranksToExecute.empty() &&
+          (std::count(ranksToExecute.begin(), ranksToExecute.end(), localRank) == 0)) continue;
+      localRanksToExecute.push_back(localRank);
+    }
+
+    numRanksToExecute = (int)localRanksToExecute.size();
+    hipGraph_t graphs[numRanksToExecute];
+    hipGraphExec_t graphExec[numRanksToExecute];
+
+    // Start HIP graph stream capture if requested
+    if (useHipGraph)
+    {
+      for (int localRank : localRanksToExecute)
+      {
+        if (this->verbose) INFO("Capturing stream for rank %d\n", localRank);
+        CHECK_HIP(hipStreamBeginCapture(this->streams[localRank], hipStreamCaptureModeGlobal));
+      }
+    }
 
     // Start group call
     CHILD_NCCL_CALL(ncclGroupStart(), "ncclGroupStart");
@@ -354,16 +430,13 @@ namespace RcclUnitTesting
     for (int collId = 0; collId < this->numCollectivesInGroup; ++collId)
     {
       // Loop over all local ranks
-      for (int localRank = 0; localRank < this->deviceIds.size(); ++localRank)
+      for (int localRank : localRanksToExecute)
       {
-        // If ranks to execute is empty, execute all ranks belonging to child
-        if (!ranksToExecute.empty() && (std::count(ranksToExecute.begin(), ranksToExecute.end(), localRank) == 0)) continue;
-
         CHECK_HIP(hipSetDevice(this->deviceIds[localRank]));
 
         CollectiveArgs const& collArg = this->collArgs[localRank][collId];
 
-        if (this->printValues)
+        if (this->printValues && !useHipGraph)
         {
           int const numInputElementsToPrint = (this->printValues < 0 ? collArg.numInputElements : this->printValues);
           PtrUnion inputCpu;
@@ -502,17 +575,60 @@ namespace RcclUnitTesting
     // End group call
     CHILD_NCCL_CALL(ncclGroupEnd(), "ncclGroupEnd");
 
-    // Synchronize
-    if (this->verbose) INFO("Child %d submits group call.  Waiting for completion\n", this->childId);
-    for (int localRank = 0; localRank < this->streams.size(); ++localRank)
+    // Instantiate and launch HIP graph if requested
+    if (useHipGraph)
     {
+      for (int localRank : localRanksToExecute)
+      {
+        if (this->verbose) INFO("Ending stream capture for rank %d\n", localRank);
+
+        CHECK_HIP(hipStreamEndCapture(this->streams[localRank], &graphs[localRank]));
+        if (this->verbose)
+        {
+          size_t numNodes;
+          hipGraphNode_t* nodes;
+          CHECK_HIP(hipGraphGetNodes(graphs[localRank], nodes, &numNodes));
+          INFO("Graph for rank %d has %lu nodes\n", localRank, numNodes);
+        }
+
+        if (this->verbose) INFO("Instantiating executable graph for rank %d\n", localRank);
+        CHECK_HIP(hipGraphInstantiate(&graphExec[localRank], graphs[localRank], NULL, NULL, 0));
+      }
+
+      for (int localRank : localRanksToExecute)
+      {
+        if (this->verbose) INFO("Launch graph for rank %d\n", localRank);
+        CHECK_HIP(hipGraphLaunch(graphExec[localRank], this->streams[localRank]));
+      }
+    }
+    else
+    {
+      if (this->verbose)
+        INFO("Child %d submits group call.  Waiting for completion\n", this->childId);
+    }
+
+    // Synchronize
+    for (int localRank : localRanksToExecute)
+    {
+      if (this->verbose) INFO("Starting synchronization for rank %d\n", localRank);
       CHECK_HIP(hipStreamSynchronize(this->streams[localRank]));
+    }
+
+    // Destroy graphs
+    if (useHipGraph)
+    {
+      for (int localRank : localRanksToExecute)
+      {
+        if (this->verbose) INFO("Destroying graphs for rank %d\n", localRank);
+        CHECK_HIP(hipGraphDestroy(graphs[localRank]));
+        CHECK_HIP(hipGraphExecDestroy(graphExec[localRank]));
+      }
     }
 
     if (this->printValues)
     {
       for (int collId = 0; collId < this->numCollectivesInGroup; ++collId)
-        for (int localRank = 0; localRank < this->deviceIds.size(); ++localRank)
+        for (int localRank : localRanksToExecute)
         {
           CollectiveArgs const& collArg = this->collArgs[localRank][collId];
 
@@ -613,6 +729,22 @@ namespace RcclUnitTesting
     if (this->verbose) INFO("Child %d begins DestroyComms\n", this->childId);
 
     // Release comms
+    for (int i = 0; i < this->comms.size(); ++i) 
+    { 
+      // Check if the communicator is non-blocking
+      if (this->useBlocking == false) 
+      { 
+        // handle the non-blocking case
+        ncclCommFinalize(this->comms[i]);
+        CHILD_NCCL_CALL_NON_BLOCKING("ncclCommGetAsyncErrorCommFinalize");        
+      }
+      else 
+      { 
+        // In case of blocking just call Finalize
+        CHILD_NCCL_CALL(ncclCommFinalize(this->comms[i]), "ncclCommFinalize");
+      }
+    }
+
     for (int i = 0; i < this->comms.size(); ++i)
     {
       CHILD_NCCL_CALL(ncclCommDestroy(this->comms[i]), "ncclCommDestroy");
