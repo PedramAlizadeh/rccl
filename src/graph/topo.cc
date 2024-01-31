@@ -780,7 +780,7 @@ ncclResult_t ncclTopoGetLocal(struct ncclTopoSystem* system, int type, int index
 ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int channelId, int* id) {
   int gpu;
   NCCLCHECK(ncclTopoRankToIndex(system, rank, &gpu));
-  int* localNets;
+  int* localNets = NULL;
   int localNetCount;
   NCCLCHECK(ncclTopoGetLocal(system, GPU, gpu, NET, &localNets, &localNetCount, NULL));
   int* localGpus;
@@ -788,29 +788,39 @@ ncclResult_t ncclTopoGetLocalNet(struct ncclTopoSystem* system, int rank, int ch
   NCCLCHECK(ncclTopoGetLocal(system, NET, localNets[0], GPU, &localGpus, &localGpuCount, NULL));
   int net = system->nodes[GPU].nodes[gpu].gpu.dev;
   if (isPow2(localNetCount)) net = mirrorBits(net, localNetCount);
-  if (localNetCount == 0) {
-    *id = -1;
-  } else {
-    net += channelId%(DIVUP(localNetCount,localGpuCount));
-    *id = system->nodes[NET].nodes[localNets[net%localNetCount]].id;
-  }
+  // if (localNetCount == 0) {
+  //   *id = -1;
+  // } else {
+  //   net += channelId%(DIVUP(localNetCount,localGpuCount));
+  //   *id = system->nodes[NET].nodes[localNets[net%localNetCount]].id;
+  // }
+  net += channelId%(DIVUP(localNetCount,localGpuCount));
+  *id = system->nodes[NET].nodes[localNets[net%localNetCount]].id;
   free(localNets);
   free(localGpus);
   return ncclSuccess;
 }
 
 ncclResult_t ncclTopoGetLocalGpu(struct ncclTopoSystem* system, int net, int* gpuIndex) {
+  int netIndex;
+  NCCLCHECK(ncclTopoIdToIndex(system, NET, net, &netIndex));
+  int* localGpus = NULL;
+  int localGpuCount;
+  NCCLCHECK(ncclTopoGetLocal(system, NET, netIndex, GPU, &localGpus, &localGpuCount, NULL));
   for (int c=0; c<MAXCHANNELS; c++) {
-    for (int g=0; g<system->nodes[GPU].count; g++) {
+    for (int lg=0; lg<localGpuCount; lg++) {
+      int g = localGpus[lg];
       struct ncclTopoNode* gpu = system->nodes[GPU].nodes+g;
       int id;
       NCCLCHECK(ncclTopoGetLocalNet(system, gpu->gpu.rank, c, &id));
       if (net == id) {
         *gpuIndex = g;
+        free(localGpus);
         return ncclSuccess;
       }
     }
   }
+  free(localGpus);
   *gpuIndex = -1;
   return ncclSuccess;
 }
