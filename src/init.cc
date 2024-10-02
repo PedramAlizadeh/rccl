@@ -1358,7 +1358,13 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
   memset(&treeGraph, 0, sizeof(struct ncclTopoGraph));
   treeGraph.id = 1;
-  treeGraph.pattern = NCCL_TOPO_PATTERN_BALANCED_TREE;
+  int idx;
+  NCCLCHECK(ncclTopoIdToIndex(comm->topo, GPU, comm->busId, &idx));
+  if (IsArchMatch(comm->topo->nodes[GPU].nodes[idx].gpu.gcn, "gfx94")) {
+    treeGraph.pattern = NCCL_TOPO_PATTERN_TREE;
+  } else {
+    treeGraph.pattern = NCCL_TOPO_PATTERN_BALANCED_TREE;
+  }
   treeGraph.collNet = 0;
   treeGraph.minChannels = comm->topo->nodes[NET].count != 0 ? 1 : ringGraph.nChannels;
   treeGraph.maxChannels = ringGraph.nChannels;
@@ -1425,8 +1431,6 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
   // AllGather3 - begin
   NCCLCHECKGOTO(ncclCalloc(&allGather3Data, nranks), ret, fail);
-  int idx;
-  NCCLCHECK(ncclTopoIdToIndex(comm->topo, GPU, comm->busId, &idx));
   allGather3Data[rank].nc = 2;
   if (comm->topo->nodes[GPU].count == comm->topo->nRanks &&
        IsArchMatch(comm->topo->nodes[GPU].nodes[idx].gpu.gcn, "gfx906") && allXgmi)

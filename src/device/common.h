@@ -15,7 +15,11 @@
 #include "network/unpack/unpack_defs.h"
 #include "comm.h"
 
+#if defined(__gfx942__)
+#define NCCL_MAX_DEV_ARITY (NCCL_MAX_TREE_ARITY)  // Using tree on Mi300 instead of balanced tree
+#else
 #define NCCL_MAX_DEV_ARITY (NCCL_MAX_TREE_ARITY-1)  // Using balanced tree instead of split tree
+#endif
 
 #define __syncwarp()
 
