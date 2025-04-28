@@ -422,7 +422,7 @@ set(SRC_FILES
   src/net.cc
   src/msccl.cc
   src/proxy.cc
-  src/register.cc
+  src/rccl_wrap.cc
   src/transport.cc
   src/device/all_gather.h
   src/device/all_reduce.h
@@ -498,12 +498,15 @@ set(SRC_FILES
   src/include/param.h
   src/include/profiler.h
   src/include/proxy.h
+  src/include/ras.h
+  src/include/rccl_common.h
   src/include/rccl_vars.h
   src/include/register.h
   src/include/rccl_float8.h
   src/include/rocm_smi_wrap.h
   src/include/rocmwrap.h
   src/include/roctx.h
+  src/include/recorder.h
   src/include/shm.h
   src/include/shmutils.h
   src/include/signals.h
@@ -575,6 +578,7 @@ set(SRC_FILES
   src/misc/rocm_smi_wrap.cc
   src/misc/rocmwrap.cc
   src/misc/roctx.cc
+  src/misc/recorder.cc
   src/misc/shmutils.cc
   src/misc/signals.cc
   src/misc/socket.cc
@@ -585,6 +589,16 @@ set(SRC_FILES
   src/misc/msccl/msccl_parser.cc
   src/misc/msccl/msccl_setup.cc
   src/misc/msccl/msccl_status.cc
+  src/ras/client.cc
+  src/ras/client_support.cc
+  src/ras/collectives.cc
+  src/ras/peers.cc
+  src/ras/ras.cc
+  src/ras/ras_internal.h
+  src/ras/rasnet.cc
+  src/register/coll_reg.cc
+  src/register/register.cc
+  src/register/sendrecv_reg.cc
   src/transport/coll_net.cc
   src/transport/generic.cc
   src/transport/net.cc
@@ -801,7 +815,9 @@ endif()
 if (HAVE_PARALLEL_JOBS)
   target_compile_options(rccl PRIVATE -parallel-jobs=12)
 endif()
-target_compile_options(rccl PRIVATE -Werror=uninitialized -Werror=sometimes-uninitialized)
+target_compile_options(rccl PRIVATE -Werror=uninitialized)
+target_compile_options(rccl PRIVATE -Werror=sometimes-uninitialized)
+target_compile_options(rccl PRIVATE -Wall)
 target_compile_options(rccl PRIVATE -Wno-format-nonliteral)
 target_compile_options(rccl PRIVATE -fgpu-rdc)               # Generate relocatable device code (required for extern __shared__)
 target_compile_options(rccl PRIVATE -fvisibility=hidden)     # Set symbol visibility to hidden by default
